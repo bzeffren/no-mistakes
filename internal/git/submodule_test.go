@@ -349,6 +349,61 @@ func TestWorktreeInitSubmodulesMalformedGitmodulesFailsClosed(t *testing.T) {
 	}
 }
 
+// TestWorktreeInitSubmodulesRejectsUndeclaredGitlink proves a committed
+// gitlink with no corresponding valid .gitmodules path entry is a hard
+// error, even when other, well-formed submodule entries exist alongside it -
+// a mixed valid/malformed .gitmodules must not let one entry silently
+// shadow the omission of another.
+func TestWorktreeInitSubmodulesRejectsUndeclaredGitlink(t *testing.T) {
+	ctx := context.Background()
+	caller, subSHA := submoduleFixture(t)
+
+	run(t, caller, "git", "update-index", "--add", "--cacheinfo", "160000,"+subSHA+",sub-hidden")
+	run(t, caller, "git", "commit", "-q", "-m", "commit an undeclared gitlink")
+	callerSHA := run(t, caller, "git", "rev-parse", "HEAD")
+
+	wt := filepath.Join(t.TempDir(), "run-wt")
+	if err := WorktreeAdd(ctx, caller, wt, callerSHA); err != nil {
+		t.Fatalf("WorktreeAdd: %v", err)
+	}
+	if err := WorktreeInitSubmodules(ctx, caller, wt); err == nil {
+		t.Fatal("expected an error for a committed gitlink with no .gitmodules entry naming it")
+	}
+}
+
+// TestWorktreeInitSubmodulesNeutralizesArbitraryGlobalFilter proves an
+// operator-configured Git filter, selected by a pushed .gitattributes, does
+// not run as a side effect of materialization - not just the well-known Git
+// LFS filter names, but any filter name at all.
+func TestWorktreeInitSubmodulesNeutralizesArbitraryGlobalFilter(t *testing.T) {
+	ctx := context.Background()
+	caller, _ := submoduleFixture(t)
+
+	marker := filepath.Join(t.TempDir(), "filter-fired")
+	globalConfig := filepath.Join(t.TempDir(), "gitconfig")
+	writeFile(t, globalConfig, "[filter \"marker\"]\n\tclean = cat\n\tsmudge = touch "+marker+" && cat\n\trequired = true\n")
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
+
+	subPath := filepath.Join(caller, "sub")
+	writeFile(t, filepath.Join(subPath, ".gitattributes"), "README.md filter=marker\n")
+	run(t, subPath, "git", "add", ".gitattributes")
+	run(t, subPath, "git", "commit", "-q", "-m", "select the marker filter for README.md")
+	run(t, caller, "git", "add", "sub")
+	run(t, caller, "git", "commit", "-q", "-m", "advance sub to the filter-selecting commit")
+	callerSHA := run(t, caller, "git", "rev-parse", "HEAD")
+
+	wt := filepath.Join(t.TempDir(), "run-wt")
+	if err := WorktreeAdd(ctx, caller, wt, callerSHA); err != nil {
+		t.Fatalf("WorktreeAdd: %v", err)
+	}
+	if err := WorktreeInitSubmodules(ctx, caller, wt); err != nil {
+		t.Fatalf("WorktreeInitSubmodules: %v", err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("an operator-configured global filter fired during materialization; it must be neutralized")
+	}
+}
+
 // TestWorktreeInitSubmodulesPrunesMaterializedSiblingsOnFailure proves a
 // later sibling's failure does not leave an earlier sibling's worktree
 // registration stranded in its embedded Git directory.

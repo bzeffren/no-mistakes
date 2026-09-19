@@ -79,6 +79,9 @@ func initSubmodulesLevel(ctx context.Context, parentGitDir, wt string, created *
 	if len(paths) == 0 {
 		return fmt.Errorf(".gitmodules is committed but declares no valid submodule path entries")
 	}
+	if err := requireEveryGitlinkIsDeclared(ctx, wt, paths); err != nil {
+		return err
+	}
 
 	// Deterministic order: a fixed, name-sorted processing order makes a
 	// partial-failure prune reproducible instead of depending on Go's
@@ -213,6 +216,43 @@ func isGitConfigNoMatch(err error) bool {
 	return errors.As(err, &exitErr) && exitErr.ExitCode() == 1
 }
 
+// requireEveryGitlinkIsDeclared cross-checks the committed tree's own gitlink
+// (mode 160000) entries against declaredPaths, .gitmodules's valid path
+// entries. A .gitmodules with a mix of well-formed and malformed sections
+// (for example a section with a url but no path key) would otherwise let a
+// real, committed gitlink simply never appear in declaredPaths - silently
+// skipped rather than materialized, letting the pipeline run against an
+// incomplete checkout. Any gitlink not covered by a declared path is a hard
+// error.
+func requireEveryGitlinkIsDeclared(ctx context.Context, wt string, declaredPaths map[string]string) error {
+	declared := make(map[string]bool, len(declaredPaths))
+	for _, p := range declaredPaths {
+		declared[p] = true
+	}
+
+	out, err := Run(ctx, wt, "ls-tree", "-r", "HEAD")
+	if err != nil {
+		return fmt.Errorf("list committed gitlinks: %w", err)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if line == "" {
+			continue
+		}
+		meta, path, found := strings.Cut(line, "\t")
+		if !found {
+			continue
+		}
+		fields := strings.Fields(meta)
+		if len(fields) < 2 || fields[0] != "160000" || fields[1] != "commit" {
+			continue
+		}
+		if !declared[path] {
+			return fmt.Errorf(".gitmodules is malformed or incomplete: commit has a submodule gitlink at %q with no valid .gitmodules path entry naming it", path)
+		}
+	}
+	return nil
+}
+
 // gitlinkRevision returns the exact commit SHA committed at path in wt's
 // checked-out HEAD, or "" if path is not a gitlink there.
 func gitlinkRevision(ctx context.Context, wt, path string) (string, error) {
@@ -238,25 +278,42 @@ func gitlinkRevision(ctx context.Context, wt, path string) (string, error) {
 // store: git worktree add resolves sha against already-present local refs
 // and objects only. GIT_NO_LAZY_FETCH additionally fails closed rather than
 // lazily fetching a missing object if gitDir happens to be a partial
-// (promisor) clone. core.hooksPath is pointed at an empty directory so a
-// hook committed in - or already present in - the embedded repository cannot
-// run as a side effect of this checkout, and the well-known Git LFS filter
-// names are neutralized to a no-op pass-through so a pushed .gitattributes
-// cannot select a locally configured LFS filter to fetch objects over the
-// network this design otherwise never touches.
+// (promisor) clone.
+//
+// core.hooksPath is pointed at an empty directory so a hook already present
+// in the embedded repository cannot run as a side effect of this checkout.
+// GIT_CONFIG_NOSYSTEM plus a throwaway, guaranteed-empty GIT_CONFIG_GLOBAL
+// exclude every system- or global-configured setting from this one
+// invocation - not just a well-known filter name such as Git LFS's - so a
+// pushed .gitattributes cannot select an operator-configured filter to run
+// an arbitrary command or fetch over the network this design otherwise
+// never touches. A filter or hook defined only in the embedded repository's
+// own local config (gitDir/config) is unaffected: that is a value the
+// operator set on that specific submodule, not something a pushed branch
+// can reach.
 func worktreeAddFromGitDir(ctx context.Context, gitDir, wtPath, sha string) error {
-	noHooksDir, err := os.MkdirTemp("", "no-mistakes-no-hooks-")
+	isolationDir, err := os.MkdirTemp("", "no-mistakes-submodule-isolation-")
 	if err != nil {
+		return fmt.Errorf("prepare hook and config isolation: %w", err)
+	}
+	defer os.RemoveAll(isolationDir)
+
+	noHooksDir := filepath.Join(isolationDir, "hooks")
+	if err := os.Mkdir(noHooksDir, 0o700); err != nil {
 		return fmt.Errorf("prepare hook isolation: %w", err)
 	}
-	defer os.RemoveAll(noHooksDir)
+	emptyGlobalConfig := filepath.Join(isolationDir, "empty-gitconfig")
+	if err := os.WriteFile(emptyGlobalConfig, nil, 0o600); err != nil {
+		return fmt.Errorf("prepare hermetic config isolation: %w", err)
+	}
 
-	_, err = RunWithEnv(ctx, gitDir, []string{"GIT_NO_LAZY_FETCH=1"},
+	_, err = RunWithEnv(ctx, gitDir, []string{
+		"GIT_NO_LAZY_FETCH=1",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=" + emptyGlobalConfig,
+	},
 		"--git-dir="+gitDir,
 		"-c", "core.hooksPath="+noHooksDir,
-		"-c", "filter.lfs.clean=cat",
-		"-c", "filter.lfs.smudge=cat",
-		"-c", "filter.lfs.process=",
 		"worktree", "add", "--detach", "--", wtPath, sha,
 	)
 	return err

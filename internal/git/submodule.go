@@ -29,7 +29,9 @@ import (
 // It makes no DNS lookup and opens no network connection - a submodule that
 // was never initialized, or whose committed revision was never fetched, in
 // sourceDir fails immediately with an actionable diagnostic instead of
-// fetching one. A repository with no .gitmodules is a successful no-op.
+// fetching one. A commit with no submodule gitlink at all is a successful
+// no-op; a commit with a gitlink but no .gitmodules naming it is an error,
+// not a no-op.
 //
 // This reads sourceDir only (rev-parse and its shared modules/ tree); it
 // never runs a submodule command there, so a Treehouse-style submodule

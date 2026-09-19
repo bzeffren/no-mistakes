@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/testgit"
+	"github.com/kunchenguid/no-mistakes/internal/worktrees"
 )
 
 // The submodule provisioning timeout and cancellation regressions need a fake
@@ -159,6 +160,31 @@ func waitForFile(t *testing.T, path string, timeout time.Duration) {
 	t.Fatalf("timed out waiting for %s", path)
 }
 
+// worktreeListRegistersPath reports whether porcelainOut, the output of
+// `git worktree list --porcelain`, registers a linked worktree at wantPath.
+// Each record begins with a "worktree <path>" line; the recorded path is
+// compared to wantPath through the repository's canonical path convention
+// (worktrees.Canonical), after filepath.FromSlash normalizes the record's
+// separators. git prints the worktree path with forward slashes on Windows,
+// so a raw strings.Contains over the porcelain text reports a genuine Windows
+// registration as missing - git's slashes never match filepath.Join's
+// backslashes. An exact canonical comparison is separator- and symlink-correct
+// on every platform (git records the symlink-resolved real path, which on
+// macOS differs from t.TempDir()'s /var spelling).
+func worktreeListRegistersPath(porcelainOut, wantPath string) bool {
+	want := worktrees.Canonical(wantPath)
+	for _, line := range strings.Split(porcelainOut, "\n") {
+		record, path, ok := strings.Cut(strings.TrimRight(line, "\r"), " ")
+		if !ok || record != "worktree" {
+			continue
+		}
+		if worktrees.Canonical(filepath.FromSlash(path)) == want {
+			return true
+		}
+	}
+	return false
+}
+
 // TestWorktreeInitSubmodulesTimesOutAndPrunesPartialMaterialization proves the
 // independent bound (submoduleInitTimeout): when a local Git operation stops
 // responding, the call fails with a deadline error instead of hanging forever,
@@ -226,7 +252,7 @@ func TestWorktreeInitSubmodulesTimesOutAndPrunesPartialMaterialization(t *testin
 	// its worktree registration in the embedded Git directory must be pruned.
 	subGitDir := filepath.Join(caller, ".git", "modules", "sub")
 	listOut := run(t, subGitDir, "git", "worktree", "list", "--porcelain")
-	if strings.Contains(listOut, filepath.Join(wt, "sub")) {
+	if worktreeListRegistersPath(listOut, filepath.Join(wt, "sub")) {
 		t.Fatalf("partial materialization was not pruned after the timeout:\n%s", listOut)
 	}
 }
@@ -273,7 +299,7 @@ func TestWorktreeInitSubmodulesCancellationPrunesRegisteredWorktree(t *testing.T
 	// cancel. Assert it here: otherwise a failed registration would leave the
 	// post-cancel absence check passing without exercising cleanup at all.
 	subGitDir := filepath.Join(caller, ".git", "modules", "sub")
-	if listOut := run(t, subGitDir, "git", "worktree", "list", "--porcelain"); !strings.Contains(listOut, filepath.Join(wt, "sub")) {
+	if listOut := run(t, subGitDir, "git", "worktree", "list", "--porcelain"); !worktreeListRegistersPath(listOut, filepath.Join(wt, "sub")) {
 		t.Fatalf("submodule worktree was not registered before cancellation:\n%s", listOut)
 	}
 
@@ -293,7 +319,7 @@ func TestWorktreeInitSubmodulesCancellationPrunesRegisteredWorktree(t *testing.T
 	// The submodule whose worktree add was killed after it registered must have
 	// been unregistered again; the run worktree's partial content must be gone.
 	listOut := run(t, subGitDir, "git", "worktree", "list", "--porcelain")
-	if strings.Contains(listOut, filepath.Join(wt, "sub")) {
+	if worktreeListRegistersPath(listOut, filepath.Join(wt, "sub")) {
 		t.Fatalf("registered submodule worktree was not pruned after cancellation:\n%s", listOut)
 	}
 	if _, err := os.Stat(filepath.Join(wt, "sub", "README.md")); err == nil {

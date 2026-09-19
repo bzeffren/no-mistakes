@@ -50,12 +50,18 @@ func WorktreeInitSubmodules(ctx context.Context, sourceDir, wt string) error {
 	initCtx, cancel := context.WithTimeout(ctx, submoduleInitTimeout)
 	defer cancel()
 
-	gitDir, err := Run(initCtx, sourceDir, "rev-parse", "--absolute-git-dir")
+	iso, cleanup, err := newSubmoduleIsolation()
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	gitDir, err := RunWithEnv(initCtx, sourceDir, iso.env, "rev-parse", "--absolute-git-dir")
 	if err != nil {
 		return annotateSubmoduleTimeout(ctx, initCtx, fmt.Errorf("resolve git directory for %s: %w", sourceDir, err))
 	}
 	var created []materializedSubmodule
-	if err := initSubmodulesLevel(initCtx, gitDir, wt, &created); err != nil {
+	if err := initSubmodulesLevel(initCtx, iso, gitDir, wt, &created); err != nil {
 		pruneMaterializedSubmodules(created)
 		return annotateSubmoduleTimeout(ctx, initCtx, err)
 	}
@@ -85,6 +91,65 @@ type materializedSubmodule struct {
 	path   string
 }
 
+// submoduleIsolation pins every Git command in the materialization path to
+// objects already present on the machine and excludes every configuration a
+// pushed branch could reach. One instance is built per WorktreeInitSubmodules
+// call and reused across the metadata reads, the revision lookups, and the
+// worktree-add checkouts, so the zero-network and config-isolation contract
+// covers all of them - not the final checkout alone.
+//
+// env carries GIT_NO_LAZY_FETCH=1 so a read against a partial (promisor) local
+// clone fails closed instead of lazily fetching a missing object over the
+// network. It excludes system (GIT_CONFIG_NOSYSTEM), global (an empty
+// GIT_CONFIG_GLOBAL), indexed (GIT_CONFIG_COUNT), and command-line-carrier
+// (GIT_CONFIG_PARAMETERS, git's environment carrier for -c key=value)
+// configuration, so a pushed .gitattributes cannot select an
+// operator-configured filter to run a command or reach the network during
+// checkout. A filter or hook defined only in a repository's own local config
+// is unaffected: that is a value the operator set on that repository, not
+// something a pushed branch can reach.
+//
+// hooksDir is an empty directory passed as core.hooksPath to the checkout, so a
+// hook already present in an embedded repository cannot run as a side effect of
+// that checkout.
+type submoduleIsolation struct {
+	env      []string
+	hooksDir string
+}
+
+// newSubmoduleIsolation builds the throwaway directory that backs the empty
+// GIT_CONFIG_GLOBAL file and the empty hooks directory, then returns the
+// isolation and a cleanup that removes the directory. The caller must defer the
+// returned cleanup.
+func newSubmoduleIsolation() (*submoduleIsolation, func(), error) {
+	dir, err := os.MkdirTemp("", "no-mistakes-submodule-isolation-")
+	if err != nil {
+		return nil, nil, fmt.Errorf("prepare hook and config isolation: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+
+	hooksDir := filepath.Join(dir, "hooks")
+	if err := os.Mkdir(hooksDir, 0o700); err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("prepare hook isolation: %w", err)
+	}
+	emptyGlobalConfig := filepath.Join(dir, "empty-gitconfig")
+	if err := os.WriteFile(emptyGlobalConfig, nil, 0o600); err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("prepare hermetic config isolation: %w", err)
+	}
+	return &submoduleIsolation{
+		env: []string{
+			"GIT_NO_LAZY_FETCH=1",
+			"GIT_CONFIG_NOSYSTEM=1",
+			"GIT_CONFIG_GLOBAL=" + emptyGlobalConfig,
+			"GIT_CONFIG_COUNT=0",
+			"GIT_CONFIG_PARAMETERS=",
+		},
+		hooksDir: hooksDir,
+	}, cleanup, nil
+}
+
 // initSubmodulesLevel materializes the submodules committed directly in wt
 // (already checked out at some revision), using parentGitDir - the Git
 // directory that owns wt - to locate each submodule's embedded Git
@@ -92,8 +157,8 @@ type materializedSubmodule struct {
 // embedded Git directory as the next level's parentGitDir. Every submodule it
 // successfully materializes is appended to *created, in creation order, so a
 // later failure can unregister them in reverse.
-func initSubmodulesLevel(ctx context.Context, parentGitDir, wt string, created *[]materializedSubmodule) error {
-	gitlinks, err := gitlinkPathsInTree(ctx, wt)
+func initSubmodulesLevel(ctx context.Context, iso *submoduleIsolation, parentGitDir, wt string, created *[]materializedSubmodule) error {
+	gitlinks, err := gitlinkPathsInTree(ctx, iso, wt)
 	if err != nil {
 		return err
 	}
@@ -110,11 +175,11 @@ func initSubmodulesLevel(ctx context.Context, parentGitDir, wt string, created *
 	// security-sensitive paths (pr.template). The separate [include]/[includeIf]
 	// redirection vector lives in the blob's own content rather than the
 	// filesystem, so it is closed by --no-includes in submodulePathsByName.
-	if _, err := Run(ctx, wt, "rev-parse", "--verify", "--quiet", "HEAD:.gitmodules"); err != nil {
+	if _, err := RunWithEnv(ctx, wt, iso.env, "rev-parse", "--verify", "--quiet", "HEAD:.gitmodules"); err != nil {
 		return fmt.Errorf("commit has %d submodule gitlink(s) but no .gitmodules file at all: initialize or fetch them in the repository's normal trusted working copy first", len(gitlinks))
 	}
 
-	paths, err := submodulePathsByName(ctx, wt)
+	paths, err := submodulePathsByName(ctx, iso, wt)
 	if err != nil {
 		return err
 	}
@@ -140,7 +205,7 @@ func initSubmodulesLevel(ctx context.Context, parentGitDir, wt string, created *
 			return err
 		}
 
-		rev, err := gitlinkRevision(ctx, wt, path)
+		rev, err := gitlinkRevision(ctx, iso, wt, path)
 		if err != nil {
 			return err
 		}
@@ -171,11 +236,11 @@ func initSubmodulesLevel(ctx context.Context, parentGitDir, wt string, created *
 		// but before this call returns; recording the submodule first keeps
 		// pruneMaterializedSubmodules able to unregister a partial registration.
 		*created = append(*created, materializedSubmodule{gitDir: subGitDir, path: subPath})
-		if err := worktreeAddFromGitDir(ctx, subGitDir, subPath, rev); err != nil {
+		if err := worktreeAddFromGitDir(ctx, iso, subGitDir, subPath, rev); err != nil {
 			return fmt.Errorf("submodule %q revision %s is not available locally: initialize or fetch it in the repository's normal trusted working copy first: %w", name, rev, err)
 		}
 
-		if err := initSubmodulesLevel(ctx, subGitDir, subPath, created); err != nil {
+		if err := initSubmodulesLevel(ctx, iso, subGitDir, subPath, created); err != nil {
 			return err
 		}
 	}
@@ -242,8 +307,8 @@ func rejectUnsafeRelativePath(s string) error {
 // follows include directives by default). It intentionally never reads the
 // URL: this design never fetches, so a submodule's remote URL is irrelevant
 // to materializing it.
-func submodulePathsByName(ctx context.Context, wt string) (map[string]string, error) {
-	out, err := Run(ctx, wt, "config", "--blob", "HEAD:.gitmodules", "--no-includes", "--get-regexp", `^submodule\..*\.path$`)
+func submodulePathsByName(ctx context.Context, iso *submoduleIsolation, wt string) (map[string]string, error) {
+	out, err := RunWithEnv(ctx, wt, iso.env, "config", "--blob", "HEAD:.gitmodules", "--no-includes", "--get-regexp", `^submodule\..*\.path$`)
 	if err != nil {
 		if isGitConfigNoMatch(err) {
 			return nil, nil
@@ -281,8 +346,8 @@ func isGitConfigNoMatch(err error) bool {
 // NUL-terminates records and returns each path verbatim, matching
 // submodulePathsByName's raw `git config` output rather than C-quoting a
 // non-ASCII or control-character path into a mismatch.
-func gitlinkPathsInTree(ctx context.Context, wt string) (map[string]bool, error) {
-	out, err := Run(ctx, wt, "ls-tree", "-r", "-z", "HEAD")
+func gitlinkPathsInTree(ctx context.Context, iso *submoduleIsolation, wt string) (map[string]bool, error) {
+	out, err := RunWithEnv(ctx, wt, iso.env, "ls-tree", "-r", "-z", "HEAD")
 	if err != nil {
 		return nil, fmt.Errorf("list committed gitlinks: %w", err)
 	}
@@ -333,8 +398,8 @@ func requireEveryGitlinkIsDeclared(gitlinks map[string]bool, declaredPaths map[s
 // is matched as the literal path it names, not reinterpreted - otherwise a
 // declared path that legitimately passed the tree cross-check could still
 // resolve to the wrong entry, or none, here.
-func gitlinkRevision(ctx context.Context, wt, path string) (string, error) {
-	out, err := Run(ctx, wt, "ls-tree", "HEAD", "--", ":(literal)"+path)
+func gitlinkRevision(ctx context.Context, iso *submoduleIsolation, wt, path string) (string, error) {
+	out, err := RunWithEnv(ctx, wt, iso.env, "ls-tree", "HEAD", "--", ":(literal)"+path)
 	if err != nil {
 		return "", fmt.Errorf("read committed submodule revision for %s: %w", path, err)
 	}
@@ -354,46 +419,21 @@ func gitlinkRevision(ctx context.Context, wt, path string) (string, error) {
 //
 // Like WorktreeAdd, this performs no fetch or clone for a full local object
 // store: git worktree add resolves sha against already-present local refs
-// and objects only. GIT_NO_LAZY_FETCH additionally fails closed rather than
-// lazily fetching a missing object if gitDir happens to be a partial
-// (promisor) clone.
-//
-// core.hooksPath is pointed at an empty directory so a hook already present
-// in the embedded repository cannot run as a side effect of this checkout.
-// GIT_CONFIG_NOSYSTEM plus a throwaway, guaranteed-empty GIT_CONFIG_GLOBAL
-// exclude every system- or global-configured setting from this one
-// invocation - not just a well-known filter name such as Git LFS's - so a
-// pushed .gitattributes cannot select an operator-configured filter to run
-// an arbitrary command or fetch over the network this design otherwise
-// never touches. GIT_CONFIG_COUNT=0 closes the same door for Git's separate
-// GIT_CONFIG_KEY_n/VALUE_n indexed-config environment mechanism. A filter or
-// hook defined only in the embedded repository's own local config
+// and objects only. The shared submoduleIsolation env fails closed rather
+// than lazily fetching a missing object if gitDir happens to be a partial
+// (promisor) clone (GIT_NO_LAZY_FETCH), and excludes every system-, global-,
+// indexed-, or command-line-carried configuration so a pushed .gitattributes
+// cannot select an operator-configured filter to run an arbitrary command or
+// fetch over the network this design otherwise never touches. core.hooksPath
+// is pointed at the isolation's empty directory so a hook already present in
+// the embedded repository cannot run as a side effect of this checkout. A
+// filter or hook defined only in the embedded repository's own local config
 // (gitDir/config) is unaffected: that is a value the operator set on that
 // specific submodule, not something a pushed branch can reach.
-func worktreeAddFromGitDir(ctx context.Context, gitDir, wtPath, sha string) error {
-	isolationDir, err := os.MkdirTemp("", "no-mistakes-submodule-isolation-")
-	if err != nil {
-		return fmt.Errorf("prepare hook and config isolation: %w", err)
-	}
-	defer os.RemoveAll(isolationDir)
-
-	noHooksDir := filepath.Join(isolationDir, "hooks")
-	if err := os.Mkdir(noHooksDir, 0o700); err != nil {
-		return fmt.Errorf("prepare hook isolation: %w", err)
-	}
-	emptyGlobalConfig := filepath.Join(isolationDir, "empty-gitconfig")
-	if err := os.WriteFile(emptyGlobalConfig, nil, 0o600); err != nil {
-		return fmt.Errorf("prepare hermetic config isolation: %w", err)
-	}
-
-	_, err = RunWithEnv(ctx, gitDir, []string{
-		"GIT_NO_LAZY_FETCH=1",
-		"GIT_CONFIG_NOSYSTEM=1",
-		"GIT_CONFIG_GLOBAL=" + emptyGlobalConfig,
-		"GIT_CONFIG_COUNT=0",
-	},
+func worktreeAddFromGitDir(ctx context.Context, iso *submoduleIsolation, gitDir, wtPath, sha string) error {
+	_, err := RunWithEnv(ctx, gitDir, iso.env,
 		"--git-dir="+gitDir,
-		"-c", "core.hooksPath="+noHooksDir,
+		"-c", "core.hooksPath="+iso.hooksDir,
 		"worktree", "add", "--detach", "--", wtPath, sha,
 	)
 	return err

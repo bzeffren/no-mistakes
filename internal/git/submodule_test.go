@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -555,6 +554,124 @@ func TestWorktreeInitSubmodulesNeutralizesArbitraryGlobalFilter(t *testing.T) {
 	}
 }
 
+// TestWorktreeInitSubmodulesNeutralizesGitConfigParametersFilter proves that a
+// filter defined only through an ambient GIT_CONFIG_PARAMETERS - git's
+// environment carrier for `-c key=value` overrides, which GIT_CONFIG_COUNT does
+// not touch - cannot run during materialization even though a pushed
+// .gitattributes selects it. The materialization path clears
+// GIT_CONFIG_PARAMETERS, so the filter is never defined and the smudge command
+// never fires.
+func TestWorktreeInitSubmodulesNeutralizesGitConfigParametersFilter(t *testing.T) {
+	ctx := context.Background()
+	caller, _ := submoduleFixture(t)
+
+	marker := filepath.Join(t.TempDir(), "filter-fired")
+	t.Setenv("GIT_CONFIG_PARAMETERS",
+		"'filter.marker.clean=cat' 'filter.marker.smudge=touch "+marker+" && cat' 'filter.marker.required=true'")
+
+	subPath := filepath.Join(caller, "sub")
+	writeFile(t, filepath.Join(subPath, ".gitattributes"), "README.md filter=marker\n")
+	run(t, subPath, "git", "add", ".gitattributes")
+	run(t, subPath, "git", "commit", "-q", "-m", "select the marker filter for README.md")
+	run(t, caller, "git", "add", "sub")
+	run(t, caller, "git", "commit", "-q", "-m", "advance sub to the filter-selecting commit")
+	callerSHA := run(t, caller, "git", "rev-parse", "HEAD")
+
+	wt := filepath.Join(t.TempDir(), "run-wt")
+	if err := WorktreeAdd(ctx, caller, wt, callerSHA); err != nil {
+		t.Fatalf("WorktreeAdd: %v", err)
+	}
+	if err := WorktreeInitSubmodules(ctx, caller, wt); err != nil {
+		t.Fatalf("WorktreeInitSubmodules: %v", err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("a filter defined via ambient GIT_CONFIG_PARAMETERS fired during materialization; it must be neutralized")
+	}
+}
+
+// TestWorktreeInitSubmodulesMetadataReadMakesNoLazyFetch proves the
+// zero-network invariant covers the metadata reads, not just the final
+// checkout: reading a committed object that is absent from a partial (promisor)
+// local clone must fail closed instead of lazily fetching it from the promisor
+// remote. The caller is turned into a promisor clone whose remote is a live but
+// forbidden listener, then the committed .gitmodules blob is deleted from the
+// shared object store, so the metadata read (`git config --blob
+// HEAD:.gitmodules`) misses locally.
+func TestWorktreeInitSubmodulesMetadataReadMakesNoLazyFetch(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+
+	subBare := filepath.Join(root, "sub.git")
+	if err := InitBare(ctx, subBare); err != nil {
+		t.Fatal(err)
+	}
+	subSeed := initTestRepo(t)
+	run(t, subSeed, "git", "remote", "add", "origin", subBare)
+	run(t, subSeed, "git", "push", "-q", "origin", "HEAD:refs/heads/main")
+	run(t, subBare, "git", "symbolic-ref", "HEAD", "refs/heads/main")
+
+	// The caller is built directly (not cloned) so its objects stay loose and
+	// the committed .gitmodules blob can be deleted to force a promisor miss.
+	// Its embedded modules/sub store still holds sub's commit, so sub itself
+	// remains materializable locally.
+	caller := initTestRepo(t)
+	runAllow(t, caller, "submodule", "add", "-q", subBare, "sub")
+	run(t, caller, "git", "commit", "-q", "-m", "add submodule")
+	callerSHA := run(t, caller, "git", "rev-parse", "HEAD")
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	connections := 0
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			connections++
+			conn.Close()
+		}
+	}()
+
+	// Mark the caller as a promisor (partial) clone pointing at the forbidden
+	// listener: a read of an absent object would otherwise lazily fetch it here.
+	run(t, caller, "git", "config", "core.repositoryformatversion", "1")
+	run(t, caller, "git", "config", "extensions.partialClone", "origin")
+	run(t, caller, "git", "remote", "add", "origin", "http://"+ln.Addr().String()+"/promisor")
+	run(t, caller, "git", "config", "remote.origin.promisor", "true")
+	run(t, caller, "git", "config", "remote.origin.partialclonefilter", "blob:none")
+
+	// Create the run worktree while the .gitmodules blob is still present.
+	wt := filepath.Join(t.TempDir(), "run-wt")
+	if err := WorktreeAdd(ctx, caller, wt, callerSHA); err != nil {
+		t.Fatalf("WorktreeAdd: %v", err)
+	}
+
+	// Delete the committed .gitmodules blob from the shared object store so the
+	// metadata read misses locally and would need a fetch to complete.
+	blob := run(t, caller, "git", "rev-parse", "HEAD:.gitmodules")
+	loose := filepath.Join(caller, ".git", "objects", blob[:2], blob[2:])
+	if err := os.Remove(loose); err != nil {
+		t.Fatalf("remove committed .gitmodules blob to force a promisor miss: %v", err)
+	}
+
+	// The call is expected to fail closed (the object is genuinely absent and no
+	// fetch is allowed); the invariant under test is only that it never
+	// contacted the promisor remote.
+	_ = WorktreeInitSubmodules(ctx, caller, wt)
+
+	ln.Close()
+	<-done
+	if connections != 0 {
+		t.Fatalf("a metadata read lazily fetched from the promisor remote %d time(s); must be zero", connections)
+	}
+}
+
 // TestWorktreeInitSubmodulesPrunesMaterializedSiblingsOnFailure proves a
 // later sibling's failure does not leave an earlier sibling's worktree
 // registration stranded in its embedded Git directory.
@@ -605,7 +722,7 @@ func TestWorktreeInitSubmodulesPrunesMaterializedSiblingsOnFailure(t *testing.T)
 	// embedded Git directory must have been pruned again.
 	subGitDir := filepath.Join(caller, ".git", "modules", "sub")
 	listOut := run(t, subGitDir, "git", "worktree", "list", "--porcelain")
-	if strings.Contains(listOut, filepath.Join(wt, "sub")) {
+	if worktreeListRegistersPath(listOut, filepath.Join(wt, "sub")) {
 		t.Fatalf("materialized sibling submodule %q was not pruned after sub2 failed:\n%s", "sub", listOut)
 	}
 }

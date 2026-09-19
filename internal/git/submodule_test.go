@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -277,5 +278,158 @@ func TestWorktreeInitSubmodulesMakesNoNetworkConnection(t *testing.T) {
 	<-done
 	if connections != 0 {
 		t.Fatalf("materialization contacted the listener %d time(s); must be zero", connections)
+	}
+}
+
+// TestWorktreeInitSubmodulesRejectsTraversalInName proves a malicious
+// .gitmodules section name cannot escape the local modules directory (the
+// CVE-2018-11235 class of bug): the gitlink at "sub" stays real and
+// resolvable, but the section that names it uses a traversal payload.
+func TestWorktreeInitSubmodulesRejectsTraversalInName(t *testing.T) {
+	ctx := context.Background()
+	caller, _ := submoduleFixture(t)
+
+	writeFile(t, filepath.Join(caller, ".gitmodules"), "[submodule \"../../evil\"]\n\tpath = sub\n\turl = http://example.invalid/sub.git\n")
+	run(t, caller, "git", "add", ".gitmodules")
+	run(t, caller, "git", "commit", "-q", "-m", "malicious submodule name")
+	callerSHA := run(t, caller, "git", "rev-parse", "HEAD")
+
+	wt := filepath.Join(t.TempDir(), "run-wt")
+	if err := WorktreeAdd(ctx, caller, wt, callerSHA); err != nil {
+		t.Fatalf("WorktreeAdd: %v", err)
+	}
+	if err := WorktreeInitSubmodules(ctx, caller, wt); err == nil {
+		t.Fatal("expected rejection of a traversal submodule name")
+	}
+	if _, err := os.Stat(filepath.Join(wt, "sub", "README.md")); err == nil {
+		t.Fatal("a rejected traversal name must not materialize anything")
+	}
+}
+
+// TestWorktreeInitSubmodulesRejectsTraversalInPath proves a malicious
+// .gitmodules path is rejected before it is ever joined into a filesystem
+// path, independent of whatever the committed tree happens to contain there.
+func TestWorktreeInitSubmodulesRejectsTraversalInPath(t *testing.T) {
+	ctx := context.Background()
+	caller, _ := submoduleFixture(t)
+
+	writeFile(t, filepath.Join(caller, ".gitmodules"), "[submodule \"sub\"]\n\tpath = ../../escape\n\turl = http://example.invalid/sub.git\n")
+	run(t, caller, "git", "add", ".gitmodules")
+	run(t, caller, "git", "commit", "-q", "-m", "malicious submodule path")
+	callerSHA := run(t, caller, "git", "rev-parse", "HEAD")
+
+	wt := filepath.Join(t.TempDir(), "run-wt")
+	if err := WorktreeAdd(ctx, caller, wt, callerSHA); err != nil {
+		t.Fatalf("WorktreeAdd: %v", err)
+	}
+	if err := WorktreeInitSubmodules(ctx, caller, wt); err == nil {
+		t.Fatal("expected rejection of a traversal submodule path")
+	}
+}
+
+// TestWorktreeInitSubmodulesMalformedGitmodulesFailsClosed proves a
+// committed .gitmodules with a gitlink section but no path key is a hard
+// error, not a silent no-op that would let the pipeline run against an
+// incomplete checkout.
+func TestWorktreeInitSubmodulesMalformedGitmodulesFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	caller, _ := submoduleFixture(t)
+
+	writeFile(t, filepath.Join(caller, ".gitmodules"), "[submodule \"sub\"]\n\turl = http://example.invalid/sub.git\n")
+	run(t, caller, "git", "add", ".gitmodules")
+	run(t, caller, "git", "commit", "-q", "-m", "malformed gitmodules missing path key")
+	callerSHA := run(t, caller, "git", "rev-parse", "HEAD")
+
+	wt := filepath.Join(t.TempDir(), "run-wt")
+	if err := WorktreeAdd(ctx, caller, wt, callerSHA); err != nil {
+		t.Fatalf("WorktreeAdd: %v", err)
+	}
+	if err := WorktreeInitSubmodules(ctx, caller, wt); err == nil {
+		t.Fatal("expected an error for a committed .gitmodules with no valid path entries")
+	}
+}
+
+// TestWorktreeInitSubmodulesPrunesMaterializedSiblingsOnFailure proves a
+// later sibling's failure does not leave an earlier sibling's worktree
+// registration stranded in its embedded Git directory.
+func TestWorktreeInitSubmodulesPrunesMaterializedSiblingsOnFailure(t *testing.T) {
+	ctx := context.Background()
+	caller, _ := submoduleFixture(t)
+	root := filepath.Dir(caller)
+
+	sub2Bare := filepath.Join(root, "sub2.git")
+	if err := InitBare(ctx, sub2Bare); err != nil {
+		t.Fatal(err)
+	}
+	sub2Seed := initTestRepo(t)
+	run(t, sub2Seed, "git", "remote", "add", "origin", sub2Bare)
+	run(t, sub2Seed, "git", "push", "-q", "origin", "HEAD:refs/heads/main")
+	run(t, sub2Bare, "git", "symbolic-ref", "HEAD", "refs/heads/main")
+
+	// Add sub2 at this original commit first, so the caller's embedded store
+	// only ever fetches it - then advance sub2Bare's own remote separately,
+	// so that new commit is never fetched into the caller.
+	runAllow(t, caller, "submodule", "add", sub2Bare, "sub2")
+	run(t, caller, "git", "commit", "-q", "-m", "add second submodule")
+
+	sub2Seed2 := filepath.Join(root, "sub2-seed-2")
+	runAllow(t, root, "clone", "-q", sub2Bare, sub2Seed2)
+	run(t, sub2Seed2, "git", "config", "user.email", "test@test.com")
+	run(t, sub2Seed2, "git", "config", "user.name", "Test")
+	writeFile(t, filepath.Join(sub2Seed2, "extra.txt"), "extra\n")
+	run(t, sub2Seed2, "git", "add", ".")
+	run(t, sub2Seed2, "git", "commit", "-q", "-m", "never fetched into caller")
+	run(t, sub2Seed2, "git", "push", "-q", "origin", "HEAD:refs/heads/main")
+	sub2NewSHA := run(t, sub2Seed2, "git", "rev-parse", "HEAD")
+
+	run(t, caller, "git", "update-index", "--cacheinfo", "160000,"+sub2NewSHA+",sub2")
+	run(t, caller, "git", "commit", "-q", "-m", "repoint sub2 to a commit never fetched locally")
+	callerSHA := run(t, caller, "git", "rev-parse", "HEAD")
+
+	wt := filepath.Join(t.TempDir(), "run-wt")
+	if err := WorktreeAdd(ctx, caller, wt, callerSHA); err != nil {
+		t.Fatalf("WorktreeAdd: %v", err)
+	}
+	if err := WorktreeInitSubmodules(ctx, caller, wt); err == nil {
+		t.Fatal("expected failure materializing sub2")
+	}
+
+	// "sub" sorts before "sub2", so it is guaranteed to have been
+	// materialized before sub2's failure; its worktree registration in the
+	// embedded Git directory must have been pruned again.
+	subGitDir := filepath.Join(caller, ".git", "modules", "sub")
+	listOut := run(t, subGitDir, "git", "worktree", "list", "--porcelain")
+	if strings.Contains(listOut, filepath.Join(wt, "sub")) {
+		t.Fatalf("materialized sibling submodule %q was not pruned after sub2 failed:\n%s", "sub", listOut)
+	}
+}
+
+// TestWorktreeInitSubmodulesSuppressesPostCheckoutHook proves a
+// post-checkout hook already present in a submodule's embedded Git
+// directory does not run as a side effect of materialization.
+func TestWorktreeInitSubmodulesSuppressesPostCheckoutHook(t *testing.T) {
+	ctx := context.Background()
+	caller, _ := submoduleFixture(t)
+	callerSHA := run(t, caller, "git", "rev-parse", "HEAD")
+
+	hookMarker := filepath.Join(t.TempDir(), "hook-fired")
+	hooksDir := filepath.Join(caller, ".git", "modules", "sub", "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(hooksDir, "post-checkout"), "#!/bin/sh\ntouch "+hookMarker+"\n")
+	if err := os.Chmod(filepath.Join(hooksDir, "post-checkout"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	wt := filepath.Join(t.TempDir(), "run-wt")
+	if err := WorktreeAdd(ctx, caller, wt, callerSHA); err != nil {
+		t.Fatalf("WorktreeAdd: %v", err)
+	}
+	if err := WorktreeInitSubmodules(ctx, caller, wt); err != nil {
+		t.Fatalf("WorktreeInitSubmodules: %v", err)
+	}
+	if _, err := os.Stat(hookMarker); err == nil {
+		t.Fatal("a post-checkout hook already present in the embedded Git directory fired during materialization; it must be suppressed")
 	}
 }

@@ -1397,7 +1397,11 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		}
 	}()
 
-	if err := git.WorktreeInitSubmodules(ctx, gateDir, wtDir); err != nil {
+	// repo.WorkingPath, not gateDir: the bare gate is populated purely by
+	// received pushes, which never transfer a submodule's own object store,
+	// so it never has one. The operator's own registered working copy does,
+	// from their normal `git submodule update --init` workflow.
+	if err := git.WorktreeInitSubmodules(ctx, repo.WorkingPath, wtDir); err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("initialize worktree submodules: %s", err))
 		trackStartFailure("init_worktree_submodules")
 		return "", fmt.Errorf("initialize worktree submodules: %w", err)

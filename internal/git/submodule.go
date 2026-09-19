@@ -105,10 +105,11 @@ func initSubmodulesLevel(ctx context.Context, parentGitDir, wt string, created *
 
 	// .gitmodules is read as the committed tree entry, never as a worktree
 	// filesystem path: a pushed branch's .gitmodules could otherwise be a
-	// symlink, or use Git config's [include]/[includeIf], to redirect this
-	// read somewhere outside the intended file. This mirrors this repo's own
-	// trusted-tree-entry convention for other security-sensitive paths
-	// (pr.template).
+	// symlink that redirects this read outside the intended file. This mirrors
+	// this repo's own trusted-tree-entry convention for other
+	// security-sensitive paths (pr.template). The separate [include]/[includeIf]
+	// redirection vector lives in the blob's own content rather than the
+	// filesystem, so it is closed by --no-includes in submodulePathsByName.
 	if _, err := Run(ctx, wt, "rev-parse", "--verify", "--quiet", "HEAD:.gitmodules"); err != nil {
 		return fmt.Errorf("commit has %d submodule gitlink(s) but no .gitmodules file at all: initialize or fetch them in the repository's normal trusted working copy first", len(gitlinks))
 	}
@@ -164,10 +165,15 @@ func initSubmodulesLevel(ctx context.Context, parentGitDir, wt string, created *
 			return fmt.Errorf("submodule %q path resolves outside the run worktree", name)
 		}
 
+		// git worktree add registers the linked worktree in subGitDir before it
+		// returns, and a cancellation (the caller's or the independent
+		// submoduleInitTimeout deadline) can kill it after that registration
+		// but before this call returns; recording the submodule first keeps
+		// pruneMaterializedSubmodules able to unregister a partial registration.
+		*created = append(*created, materializedSubmodule{gitDir: subGitDir, path: subPath})
 		if err := worktreeAddFromGitDir(ctx, subGitDir, subPath, rev); err != nil {
 			return fmt.Errorf("submodule %q revision %s is not available locally: initialize or fetch it in the repository's normal trusted working copy first: %w", name, rev, err)
 		}
-		*created = append(*created, materializedSubmodule{gitDir: subGitDir, path: subPath})
 
 		if err := initSubmodulesLevel(ctx, subGitDir, subPath, created); err != nil {
 			return err
@@ -230,11 +236,14 @@ func rejectUnsafeRelativePath(s string) error {
 
 // submodulePathsByName reads name -> path for every submodule section in
 // HEAD's committed .gitmodules blob, via `git config --blob`, which never
-// touches the worktree filesystem. It intentionally never reads the URL:
-// this design never fetches, so a submodule's remote URL is irrelevant to
-// materializing it.
+// touches the worktree filesystem. --no-includes stops a committed
+// [include]/[includeIf] directive inside that blob from making git config
+// open and merge an attacker-chosen file outside the repository (git config
+// follows include directives by default). It intentionally never reads the
+// URL: this design never fetches, so a submodule's remote URL is irrelevant
+// to materializing it.
 func submodulePathsByName(ctx context.Context, wt string) (map[string]string, error) {
-	out, err := Run(ctx, wt, "config", "--blob", "HEAD:.gitmodules", "--get-regexp", `^submodule\..*\.path$`)
+	out, err := Run(ctx, wt, "config", "--blob", "HEAD:.gitmodules", "--no-includes", "--get-regexp", `^submodule\..*\.path$`)
 	if err != nil {
 		if isGitConfigNoMatch(err) {
 			return nil, nil

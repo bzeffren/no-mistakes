@@ -95,18 +95,6 @@ func installFakeGit(t *testing.T, body string) {
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
-func waitForFile(t *testing.T, path string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", path)
-}
-
 func readTestPID(t *testing.T, path string) int {
 	t.Helper()
 	b, err := os.ReadFile(path)

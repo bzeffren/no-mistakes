@@ -1,4 +1,7 @@
 # Build output
+# Anchored to the repo root only, so `go build ./cmd/no-mistakes` output cannot
+# be staged while bin/no-mistakes and cmd/no-mistakes stay tracked.
+/no-mistakes
 bin/
 tmp/
 .tmp/

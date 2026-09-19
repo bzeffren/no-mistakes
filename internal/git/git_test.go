@@ -29,7 +29,14 @@ func TestMain(m *testing.M) {
 	if err := os.Unsetenv("GIT_CONFIG_COUNT"); err != nil {
 		panic(err)
 	}
+	cleanupFakeGit, buildErr := buildFakeGitHelper()
+	if buildErr != nil {
+		fakeGitBuildErr = buildErr
+	}
 	code := m.Run()
+	if cleanupFakeGit != nil {
+		cleanupFakeGit()
+	}
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
 }

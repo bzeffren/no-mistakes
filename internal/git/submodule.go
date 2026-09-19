@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/worktrees"
 )
@@ -43,7 +44,7 @@ func WorktreeInitSubmodules(ctx context.Context, sourceDir, wt string) error {
 	}
 	var created []materializedSubmodule
 	if err := initSubmodulesLevel(ctx, gitDir, wt, &created); err != nil {
-		pruneMaterializedSubmodules(ctx, created)
+		pruneMaterializedSubmodules(created)
 		return err
 	}
 	return nil
@@ -62,6 +63,16 @@ type materializedSubmodule struct {
 // successfully materializes is appended to *created, in creation order, so a
 // later failure can unregister them in reverse.
 func initSubmodulesLevel(ctx context.Context, parentGitDir, wt string, created *[]materializedSubmodule) error {
+	gitlinks, err := gitlinkPathsInTree(ctx, wt)
+	if err != nil {
+		return err
+	}
+	if len(gitlinks) == 0 {
+		// No committed gitlink at all: a genuinely submodule-free tree,
+		// regardless of whether a stray .gitmodules happens to exist.
+		return nil
+	}
+
 	// .gitmodules is read as the committed tree entry, never as a worktree
 	// filesystem path: a pushed branch's .gitmodules could otherwise be a
 	// symlink, or use Git config's [include]/[includeIf], to redirect this
@@ -69,7 +80,7 @@ func initSubmodulesLevel(ctx context.Context, parentGitDir, wt string, created *
 	// trusted-tree-entry convention for other security-sensitive paths
 	// (pr.template).
 	if _, err := Run(ctx, wt, "rev-parse", "--verify", "--quiet", "HEAD:.gitmodules"); err != nil {
-		return nil
+		return fmt.Errorf("commit has %d submodule gitlink(s) but no .gitmodules file at all: initialize or fetch them in the repository's normal trusted working copy first", len(gitlinks))
 	}
 
 	paths, err := submodulePathsByName(ctx, wt)
@@ -79,7 +90,7 @@ func initSubmodulesLevel(ctx context.Context, parentGitDir, wt string, created *
 	if len(paths) == 0 {
 		return fmt.Errorf(".gitmodules is committed but declares no valid submodule path entries")
 	}
-	if err := requireEveryGitlinkIsDeclared(ctx, wt, paths); err != nil {
+	if err := requireEveryGitlinkIsDeclared(gitlinks, paths); err != nil {
 		return err
 	}
 
@@ -140,12 +151,20 @@ func initSubmodulesLevel(ctx context.Context, parentGitDir, wt string, created *
 // a parent's own directory removal is never the only cleanup a caller relies
 // on: the submodule's embedded Git directory otherwise keeps a stale
 // worktree registration (and its retained objects) after the run worktree
-// that pointed at it is gone. Best-effort: a removal failure is not
-// escalated, since the caller is already returning the original error.
-func pruneMaterializedSubmodules(ctx context.Context, created []materializedSubmodule) {
+// that pointed at it is gone.
+//
+// It uses its own short-lived, independent context rather than the caller's:
+// the caller's context may itself be why initSubmodulesLevel failed (for
+// example daemon shutdown), and reusing an already-canceled context here
+// would make cleanup fail closed exactly when it is most needed.
+// Best-effort: a removal failure is not escalated, since the caller is
+// already returning the original error.
+func pruneMaterializedSubmodules(created []materializedSubmodule) {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	for i := len(created) - 1; i >= 0; i-- {
 		m := created[i]
-		_, _ = Run(ctx, m.gitDir, "--git-dir="+m.gitDir, "worktree", "remove", "--force", m.path)
+		_, _ = Run(cleanupCtx, m.gitDir, "--git-dir="+m.gitDir, "worktree", "remove", "--force", m.path)
 	}
 }
 
@@ -216,24 +235,16 @@ func isGitConfigNoMatch(err error) bool {
 	return errors.As(err, &exitErr) && exitErr.ExitCode() == 1
 }
 
-// requireEveryGitlinkIsDeclared cross-checks the committed tree's own gitlink
-// (mode 160000) entries against declaredPaths, .gitmodules's valid path
-// entries. A .gitmodules with a mix of well-formed and malformed sections
-// (for example a section with a url but no path key) would otherwise let a
-// real, committed gitlink simply never appear in declaredPaths - silently
-// skipped rather than materialized, letting the pipeline run against an
-// incomplete checkout. Any gitlink not covered by a declared path is a hard
-// error.
-func requireEveryGitlinkIsDeclared(ctx context.Context, wt string, declaredPaths map[string]string) error {
-	declared := make(map[string]bool, len(declaredPaths))
-	for _, p := range declaredPaths {
-		declared[p] = true
-	}
-
+// gitlinkPathsInTree returns every mode-160000 (gitlink) path committed in
+// wt's checked-out HEAD, read via `git ls-tree -r HEAD` with no pathspec
+// argument, so no path in the result is subject to Git's pathspec magic
+// interpretation (unlike a pathspec passed as a command argument).
+func gitlinkPathsInTree(ctx context.Context, wt string) (map[string]bool, error) {
 	out, err := Run(ctx, wt, "ls-tree", "-r", "HEAD")
 	if err != nil {
-		return fmt.Errorf("list committed gitlinks: %w", err)
+		return nil, fmt.Errorf("list committed gitlinks: %w", err)
 	}
+	result := map[string]bool{}
 	for _, line := range strings.Split(out, "\n") {
 		if line == "" {
 			continue
@@ -246,6 +257,25 @@ func requireEveryGitlinkIsDeclared(ctx context.Context, wt string, declaredPaths
 		if len(fields) < 2 || fields[0] != "160000" || fields[1] != "commit" {
 			continue
 		}
+		result[path] = true
+	}
+	return result, nil
+}
+
+// requireEveryGitlinkIsDeclared cross-checks gitlinks, the committed tree's
+// own gitlink paths, against declaredPaths, .gitmodules's valid path
+// entries. A .gitmodules with a mix of well-formed and malformed sections
+// (for example a section with a url but no path key) would otherwise let a
+// real, committed gitlink simply never appear in declaredPaths - silently
+// skipped rather than materialized, letting the pipeline run against an
+// incomplete checkout. Any gitlink not covered by a declared path is a hard
+// error.
+func requireEveryGitlinkIsDeclared(gitlinks map[string]bool, declaredPaths map[string]string) error {
+	declared := make(map[string]bool, len(declaredPaths))
+	for _, p := range declaredPaths {
+		declared[p] = true
+	}
+	for path := range gitlinks {
 		if !declared[path] {
 			return fmt.Errorf(".gitmodules is malformed or incomplete: commit has a submodule gitlink at %q with no valid .gitmodules path entry naming it", path)
 		}
@@ -255,8 +285,14 @@ func requireEveryGitlinkIsDeclared(ctx context.Context, wt string, declaredPaths
 
 // gitlinkRevision returns the exact commit SHA committed at path in wt's
 // checked-out HEAD, or "" if path is not a gitlink there.
+//
+// path is passed with a ":(literal)" pathspec prefix so a .gitmodules value
+// that happens to look like Git pathspec magic (for example a leading ":")
+// is matched as the literal path it names, not reinterpreted - otherwise a
+// declared path that legitimately passed the tree cross-check could still
+// resolve to the wrong entry, or none, here.
 func gitlinkRevision(ctx context.Context, wt, path string) (string, error) {
-	out, err := Run(ctx, wt, "ls-tree", "HEAD", "--", path)
+	out, err := Run(ctx, wt, "ls-tree", "HEAD", "--", ":(literal)"+path)
 	if err != nil {
 		return "", fmt.Errorf("read committed submodule revision for %s: %w", path, err)
 	}
@@ -287,10 +323,11 @@ func gitlinkRevision(ctx context.Context, wt, path string) (string, error) {
 // invocation - not just a well-known filter name such as Git LFS's - so a
 // pushed .gitattributes cannot select an operator-configured filter to run
 // an arbitrary command or fetch over the network this design otherwise
-// never touches. A filter or hook defined only in the embedded repository's
-// own local config (gitDir/config) is unaffected: that is a value the
-// operator set on that specific submodule, not something a pushed branch
-// can reach.
+// never touches. GIT_CONFIG_COUNT=0 closes the same door for Git's separate
+// GIT_CONFIG_KEY_n/VALUE_n indexed-config environment mechanism. A filter or
+// hook defined only in the embedded repository's own local config
+// (gitDir/config) is unaffected: that is a value the operator set on that
+// specific submodule, not something a pushed branch can reach.
 func worktreeAddFromGitDir(ctx context.Context, gitDir, wtPath, sha string) error {
 	isolationDir, err := os.MkdirTemp("", "no-mistakes-submodule-isolation-")
 	if err != nil {
@@ -311,6 +348,7 @@ func worktreeAddFromGitDir(ctx context.Context, gitDir, wtPath, sha string) erro
 		"GIT_NO_LAZY_FETCH=1",
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=" + emptyGlobalConfig,
+		"GIT_CONFIG_COUNT=0",
 	},
 		"--git-dir="+gitDir,
 		"-c", "core.hooksPath="+noHooksDir,

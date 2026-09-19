@@ -2,8 +2,10 @@ package git
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,6 +17,21 @@ func runAllow(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	full := append([]string{"-c", "protocol.file.allow=always"}, args...)
 	return run(t, dir, "git", full...)
+}
+
+// runAllowErr is runAllow for a call whose failure is an expected, skippable
+// outcome (an unusual path git or the filesystem may reject) rather than a
+// test failure.
+func runAllowErr(t *testing.T, dir string, args ...string) error {
+	t.Helper()
+	full := append([]string{"-c", "protocol.file.allow=always"}, args...)
+	cmd := exec.Command("git", full...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, out)
+	}
+	return nil
 }
 
 // submoduleFixture builds a bare submodule repository (subBare) with one
@@ -346,6 +363,91 @@ func TestWorktreeInitSubmodulesMalformedGitmodulesFailsClosed(t *testing.T) {
 	}
 	if err := WorktreeInitSubmodules(ctx, caller, wt); err == nil {
 		t.Fatal("expected an error for a committed .gitmodules with no valid path entries")
+	}
+}
+
+// TestWorktreeInitSubmodulesRejectsGitlinkWithNoGitmodulesFile proves a
+// committed gitlink is an error, not a silent no-op, when .gitmodules is
+// absent from the tree entirely - not just when it is present but
+// malformed.
+func TestWorktreeInitSubmodulesRejectsGitlinkWithNoGitmodulesFile(t *testing.T) {
+	ctx := context.Background()
+	caller, _ := submoduleFixture(t)
+
+	run(t, caller, "git", "rm", "-q", "--cached", ".gitmodules")
+	if err := os.Remove(filepath.Join(caller, ".gitmodules")); err != nil {
+		t.Fatal(err)
+	}
+	run(t, caller, "git", "commit", "-q", "-m", "drop .gitmodules but keep the gitlink")
+	callerSHA := run(t, caller, "git", "rev-parse", "HEAD")
+
+	wt := filepath.Join(t.TempDir(), "run-wt")
+	if err := WorktreeAdd(ctx, caller, wt, callerSHA); err != nil {
+		t.Fatalf("WorktreeAdd: %v", err)
+	}
+	if err := WorktreeInitSubmodules(ctx, caller, wt); err == nil {
+		t.Fatal("expected an error for a committed gitlink with no .gitmodules file at all")
+	}
+}
+
+// TestWorktreeInitSubmodulesHandlesPathLookingLikePathspecMagic proves a
+// .gitmodules path that happens to look like Git pathspec magic (a leading
+// ":") is still matched to its real, literal gitlink and materialized,
+// rather than being misinterpreted or rejected by Git's own pathspec
+// parser. Even `git submodule add` itself cannot register a path shaped
+// like this (its own internal `git add` call hits the identical pathspec
+// misinterpretation), so the embedded Git directory and the gitlink are
+// both built directly through plumbing here, exactly as a crafted pushed
+// commit would have to.
+func TestWorktreeInitSubmodulesHandlesPathLookingLikePathspecMagic(t *testing.T) {
+	ctx := context.Background()
+	caller, _ := submoduleFixture(t)
+	root := filepath.Dir(caller)
+	magicName := ":(icase)sub2"
+
+	sub2Bare := filepath.Join(root, "sub2.git")
+	if err := InitBare(ctx, sub2Bare); err != nil {
+		t.Fatal(err)
+	}
+	sub2Seed := initTestRepo(t)
+	run(t, sub2Seed, "git", "remote", "add", "origin", sub2Bare)
+	run(t, sub2Seed, "git", "push", "-q", "origin", "HEAD:refs/heads/main")
+	run(t, sub2Bare, "git", "symbolic-ref", "HEAD", "refs/heads/main")
+	sub2SHA := run(t, sub2Bare, "git", "rev-parse", "refs/heads/main")
+
+	// git submodule add's own internal `git add <path>` call hits the same
+	// pathspec-magic misinterpretation this test exists to catch in
+	// gitlinkRevision, so it cannot register this path either; the clone it
+	// performs before that failure still leaves a real embedded Git
+	// directory behind, which is all this fixture needs.
+	if err := runAllowErr(t, caller, "submodule", "add", sub2Bare, magicName); err == nil {
+		t.Fatal("expected git submodule add to fail registering a pathspec-magic-shaped path")
+	}
+	if _, err := os.Stat(filepath.Join(caller, ".git", "modules", magicName)); err != nil {
+		t.Skipf("git did not leave an embedded Git directory behind at %q: %v", magicName, err)
+	}
+
+	run(t, caller, "git", "update-index", "--add", "--cacheinfo", "160000,"+sub2SHA+","+magicName)
+	existing, err := os.ReadFile(filepath.Join(caller, ".gitmodules"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	addition := "[submodule \"" + magicName + "\"]\n\tpath = " + magicName + "\n\turl = " + sub2Bare + "\n"
+	writeFile(t, filepath.Join(caller, ".gitmodules"), string(existing)+addition)
+	run(t, caller, "git", "add", ".gitmodules")
+	run(t, caller, "git", "commit", "-q", "-m", "add a submodule at a pathspec-magic-shaped path via plumbing")
+	callerSHA := run(t, caller, "git", "rev-parse", "HEAD")
+
+	wt := filepath.Join(t.TempDir(), "run-wt")
+	if err := WorktreeAdd(ctx, caller, wt, callerSHA); err != nil {
+		t.Fatalf("WorktreeAdd: %v", err)
+	}
+	if err := WorktreeInitSubmodules(ctx, caller, wt); err != nil {
+		t.Fatalf("WorktreeInitSubmodules: %v", err)
+	}
+	got := run(t, filepath.Join(wt, magicName), "git", "rev-parse", "HEAD")
+	if got != sub2SHA {
+		t.Fatalf("materialized submodule at %s, want %s (pathspec magic was misinterpreted instead of treated as a literal path)", got, sub2SHA)
 	}
 }
 

@@ -96,6 +96,55 @@ func TestWorktreeInitSubmodulesMaterializesCommittedGitlinkRevision(t *testing.T
 	}
 }
 
+// TestWorktreeInitSubmodulesMaterializesNonASCIIGitlinkPath proves a submodule
+// committed at a non-ASCII path is materialized rather than rejected as
+// malformed: `git ls-tree` C-quotes such a path while `git config --blob`
+// returns it verbatim, so the two cross-check spellings must still agree.
+func TestWorktreeInitSubmodulesMaterializesNonASCIIGitlinkPath(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+
+	subBare := filepath.Join(root, "sub.git")
+	if err := InitBare(ctx, subBare); err != nil {
+		t.Fatal(err)
+	}
+	subSeed := initTestRepo(t)
+	run(t, subSeed, "git", "remote", "add", "origin", subBare)
+	run(t, subSeed, "git", "push", "-q", "origin", "HEAD:refs/heads/main")
+	run(t, subBare, "git", "symbolic-ref", "HEAD", "refs/heads/main")
+	subSHA := run(t, subSeed, "git", "rev-parse", "HEAD")
+
+	parentBare := filepath.Join(root, "parent.git")
+	if err := InitBare(ctx, parentBare); err != nil {
+		t.Fatal(err)
+	}
+	parentSeed := initTestRepo(t)
+	const subPath = "café/sub"
+	runAllow(t, parentSeed, "submodule", "add", "-q", subBare, subPath)
+	run(t, parentSeed, "git", "commit", "-q", "-m", "add submodule at a non-ASCII path")
+	run(t, parentSeed, "git", "remote", "add", "origin", parentBare)
+	run(t, parentSeed, "git", "push", "-q", "origin", "HEAD:refs/heads/main")
+	run(t, parentBare, "git", "symbolic-ref", "HEAD", "refs/heads/main")
+
+	caller := filepath.Join(root, "caller")
+	runAllow(t, root, "clone", "-q", "--recurse-submodules", parentBare, caller)
+	callerSHA := run(t, caller, "git", "rev-parse", "HEAD")
+
+	wt := filepath.Join(t.TempDir(), "run-wt")
+	if err := WorktreeAdd(ctx, caller, wt, callerSHA); err != nil {
+		t.Fatalf("WorktreeAdd: %v", err)
+	}
+	if err := WorktreeInitSubmodules(ctx, caller, wt); err != nil {
+		t.Fatalf("WorktreeInitSubmodules: %v", err)
+	}
+	if got := run(t, filepath.Join(wt, subPath), "git", "rev-parse", "HEAD"); got != subSHA {
+		t.Fatalf("materialized submodule at %s, want %s", got, subSHA)
+	}
+	if _, err := os.Stat(filepath.Join(wt, subPath, "README.md")); err != nil {
+		t.Fatalf("submodule content not materialized: %v", err)
+	}
+}
+
 func TestWorktreeInitSubmodulesNestedSubmodules(t *testing.T) {
 	ctx := context.Background()
 	caller, _ := submoduleFixture(t)

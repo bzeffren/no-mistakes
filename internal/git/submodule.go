@@ -238,16 +238,19 @@ func isGitConfigNoMatch(err error) bool {
 }
 
 // gitlinkPathsInTree returns every mode-160000 (gitlink) path committed in
-// wt's checked-out HEAD, read via `git ls-tree -r HEAD` with no pathspec
+// wt's checked-out HEAD, read via `git ls-tree -r -z HEAD` with no pathspec
 // argument, so no path in the result is subject to Git's pathspec magic
-// interpretation (unlike a pathspec passed as a command argument).
+// interpretation (unlike a pathspec passed as a command argument). -z
+// NUL-terminates records and returns each path verbatim, matching
+// submodulePathsByName's raw `git config` output rather than C-quoting a
+// non-ASCII or control-character path into a mismatch.
 func gitlinkPathsInTree(ctx context.Context, wt string) (map[string]bool, error) {
-	out, err := Run(ctx, wt, "ls-tree", "-r", "HEAD")
+	out, err := Run(ctx, wt, "ls-tree", "-r", "-z", "HEAD")
 	if err != nil {
 		return nil, fmt.Errorf("list committed gitlinks: %w", err)
 	}
 	result := map[string]bool{}
-	for _, line := range strings.Split(out, "\n") {
+	for _, line := range strings.Split(out, "\x00") {
 		if line == "" {
 			continue
 		}

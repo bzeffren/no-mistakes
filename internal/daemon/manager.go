@@ -1397,6 +1397,12 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		}
 	}()
 
+	if err := git.WorktreeInitSubmodules(ctx, gateDir, wtDir); err != nil {
+		m.db.UpdateRunError(run.ID, fmt.Sprintf("initialize worktree submodules: %s", err))
+		trackStartFailure("init_worktree_submodules")
+		return "", fmt.Errorf("initialize worktree submodules: %w", err)
+	}
+
 	if err := git.CopyLocalUserIdentity(ctx, repo.WorkingPath, wtDir); err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("configure worktree git identity: %s", err))
 		trackStartFailure("configure_worktree_identity")

@@ -27,7 +27,13 @@ func main() {
 		}
 	case "register-block":
 		if isWorktreeAdd(args) {
-			_ = forwardToRealGit(real, args) // let the worktree genuinely register
+			// Let the worktree genuinely register, but signal readiness only
+			// once it did: a failed add must surface to the test as that
+			// failing exit code, not masquerade as a clean cancellation with
+			// nothing left to clean up.
+			if code := forwardToRealGit(real, args); code != 0 {
+				os.Exit(code)
+			}
 			if ready := os.Getenv("NM_FAKE_GIT_READY"); ready != "" {
 				_ = os.WriteFile(ready, []byte("ready"), 0o600)
 			}

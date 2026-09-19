@@ -267,6 +267,16 @@ func TestWorktreeInitSubmodulesCancellationPrunesRegisteredWorktree(t *testing.T
 	}()
 
 	waitForFile(t, marker, 30*time.Second) // the worktree registration has landed
+
+	// The marker is now written only after the forwarded `git worktree add`
+	// succeeded, so the linked-worktree registration must be present before we
+	// cancel. Assert it here: otherwise a failed registration would leave the
+	// post-cancel absence check passing without exercising cleanup at all.
+	subGitDir := filepath.Join(caller, ".git", "modules", "sub")
+	if listOut := run(t, subGitDir, "git", "worktree", "list", "--porcelain"); !strings.Contains(listOut, filepath.Join(wt, "sub")) {
+		t.Fatalf("submodule worktree was not registered before cancellation:\n%s", listOut)
+	}
+
 	cancel()
 	<-done
 
@@ -282,7 +292,6 @@ func TestWorktreeInitSubmodulesCancellationPrunesRegisteredWorktree(t *testing.T
 
 	// The submodule whose worktree add was killed after it registered must have
 	// been unregistered again; the run worktree's partial content must be gone.
-	subGitDir := filepath.Join(caller, ".git", "modules", "sub")
 	listOut := run(t, subGitDir, "git", "worktree", "list", "--porcelain")
 	if strings.Contains(listOut, filepath.Join(wt, "sub")) {
 		t.Fatalf("registered submodule worktree was not pruned after cancellation:\n%s", listOut)

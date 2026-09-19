@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // runAllow runs git with protocol.file.allow=always, for the local file://
@@ -637,5 +639,88 @@ func TestWorktreeInitSubmodulesSuppressesPostCheckoutHook(t *testing.T) {
 	}
 	if _, err := os.Stat(hookMarker); err == nil {
 		t.Fatal("a post-checkout hook already present in the embedded Git directory fired during materialization; it must be suppressed")
+	}
+}
+
+// TestWorktreeInitSubmodulesTimesOutAndPrunesPartialMaterialization proves the
+// independent bound (submoduleInitTimeout): when a local Git operation stops
+// responding, the call fails with a deadline error instead of hanging forever,
+// and the sibling submodule already materialized before the stall is pruned
+// again. A fake git on PATH sleeps far longer than the shortened bound whenever
+// it is asked about "sub2", so materialization wedges at sub2's revision lookup
+// - after "sub" (which sorts first) is already materialized and recorded.
+func TestWorktreeInitSubmodulesTimesOutAndPrunesPartialMaterialization(t *testing.T) {
+	ctx := context.Background()
+	caller, _ := submoduleFixture(t)
+	root := filepath.Dir(caller)
+
+	// A second, fully local submodule: its revision lookup would ordinarily
+	// succeed, so the only reason it stalls is the fake git's sleep.
+	sub2Bare := filepath.Join(root, "sub2.git")
+	if err := InitBare(ctx, sub2Bare); err != nil {
+		t.Fatal(err)
+	}
+	sub2Seed := initTestRepo(t)
+	run(t, sub2Seed, "git", "remote", "add", "origin", sub2Bare)
+	run(t, sub2Seed, "git", "push", "-q", "origin", "HEAD:refs/heads/main")
+	run(t, sub2Bare, "git", "symbolic-ref", "HEAD", "refs/heads/main")
+	runAllow(t, caller, "submodule", "add", sub2Bare, "sub2")
+	run(t, caller, "git", "commit", "-q", "-m", "add second submodule")
+	callerSHA := run(t, caller, "git", "rev-parse", "HEAD")
+
+	// Create the run worktree with the real git, before the fake one is on PATH.
+	wt := filepath.Join(t.TempDir(), "run-wt")
+	if err := WorktreeAdd(ctx, caller, wt, callerSHA); err != nil {
+		t.Fatalf("WorktreeAdd: %v", err)
+	}
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("locate real git: %v", err)
+	}
+	fakeDir := t.TempDir()
+	fakeGit := "#!/bin/sh\n" +
+		"for arg in \"$@\"; do\n" +
+		"\tcase \"$arg\" in\n" +
+		"\t*sub2*) exec sleep 60 ;;\n" +
+		"\tesac\n" +
+		"done\n" +
+		"exec " + realGit + " \"$@\"\n"
+	writeFile(t, filepath.Join(fakeDir, "git"), fakeGit)
+	if err := os.Chmod(filepath.Join(fakeDir, "git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// A short bound - generous enough for "sub" to materialize on any machine,
+	// far below the fake git's 60s stall on "sub2".
+	oldTimeout := submoduleInitTimeout
+	submoduleInitTimeout = 3 * time.Second
+	t.Cleanup(func() { submoduleInitTimeout = oldTimeout })
+
+	oldPath := os.Getenv("PATH")
+	os.Setenv("PATH", fakeDir+string(os.PathListSeparator)+oldPath)
+	t.Cleanup(func() { os.Setenv("PATH", oldPath) })
+
+	start := time.Now()
+	err = WorktreeInitSubmodules(ctx, caller, wt)
+	elapsed := time.Since(start)
+	os.Setenv("PATH", oldPath) // real git again for the assertions below
+
+	if err == nil {
+		t.Fatal("expected a timeout error; the unresponsive local operation was not bounded")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error is not a deadline timeout: %v", err)
+	}
+	if elapsed >= 30*time.Second {
+		t.Fatalf("call took %s; the bound did not cut the unresponsive operation short", elapsed)
+	}
+
+	// "sub" sorts before "sub2", so it was materialized before sub2 stalled;
+	// its worktree registration in the embedded Git directory must be pruned.
+	subGitDir := filepath.Join(caller, ".git", "modules", "sub")
+	listOut := run(t, subGitDir, "git", "worktree", "list", "--porcelain")
+	if strings.Contains(listOut, filepath.Join(wt, "sub")) {
+		t.Fatalf("partial materialization was not pruned after the timeout:\n%s", listOut)
 	}
 }

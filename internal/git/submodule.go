@@ -39,17 +39,45 @@ import (
 // submodule already materialized during this call is unregistered again
 // before returning, so a partial recursive failure leaves no stale worktree
 // metadata in sourceDir's own submodule stores.
+//
+// The whole recursive materialization is bounded independently by
+// submoduleInitTimeout. Materialization is entirely local, so a call that
+// stops making progress is a wedged local Git process, not slow network I/O;
+// the bound turns that into the same loud, cleaned-up failure a missing
+// repository already produces instead of holding run setup open forever. The
+// caller's own cancellation still propagates through the derived context.
 func WorktreeInitSubmodules(ctx context.Context, sourceDir, wt string) error {
-	gitDir, err := Run(ctx, sourceDir, "rev-parse", "--absolute-git-dir")
+	initCtx, cancel := context.WithTimeout(ctx, submoduleInitTimeout)
+	defer cancel()
+
+	gitDir, err := Run(initCtx, sourceDir, "rev-parse", "--absolute-git-dir")
 	if err != nil {
-		return fmt.Errorf("resolve git directory for %s: %w", sourceDir, err)
+		return annotateSubmoduleTimeout(ctx, initCtx, fmt.Errorf("resolve git directory for %s: %w", sourceDir, err))
 	}
 	var created []materializedSubmodule
-	if err := initSubmodulesLevel(ctx, gitDir, wt, &created); err != nil {
+	if err := initSubmodulesLevel(initCtx, gitDir, wt, &created); err != nil {
 		pruneMaterializedSubmodules(created)
-		return err
+		return annotateSubmoduleTimeout(ctx, initCtx, err)
 	}
 	return nil
+}
+
+// submoduleInitTimeout bounds one WorktreeInitSubmodules call. It is a
+// generous ceiling - materialization touches only local objects - whose sole
+// job is to convert an unresponsive local Git operation into a bounded
+// failure. It is a package var so a test can shorten it.
+var submoduleInitTimeout = 120 * time.Second
+
+// annotateSubmoduleTimeout adds an actionable diagnostic when the bound this
+// call imposes (submoduleInitTimeout), rather than the caller's own
+// cancellation, is what stopped it: initCtx reached its deadline while the
+// caller's context is still live. Caller cancellation is passed through
+// unchanged so it stays distinguishable from a local stall.
+func annotateSubmoduleTimeout(callerCtx, initCtx context.Context, err error) error {
+	if callerCtx.Err() == nil && errors.Is(initCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("materialize worktree submodules: a local Git operation did not finish within %s and was stopped: %w", submoduleInitTimeout, err)
+	}
+	return err
 }
 
 type materializedSubmodule struct {
